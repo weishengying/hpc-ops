@@ -187,3 +187,67 @@ def allclose(ref_tensor, real_tensor, atol=1e-8, rtol=1e-5):
             )
         )
     return is_true
+
+
+FP8_MAX = 448
+FP4_MAX = 6.0
+FP4_LEVELS = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+
+
+def _ue8m0_scale(amax, value_max):
+    """Per-block UE8M0 (power-of-two) dequant scale, stored as float8_e8m0fnu."""
+    scale = (amax / value_max).clamp_min(1e-30).log2().ceil().exp2()
+    return scale.to(torch.float8_e8m0fnu)
+
+
+def quantize_mxfp8(w, block=32):
+    """MXFP8 quantization along the last dim: fp8-e4m3 elements + UE8M0 scale."""
+    shape = w.shape
+    blocks = w.reshape(*shape[:-1], shape[-1] // block, block)
+    scale = _ue8m0_scale(blocks.abs().amax(dim=-1, keepdim=True), FP8_MAX)
+    w_fp8 = (blocks / scale.to(torch.float32)).reshape(shape).to(torch.float8_e4m3fn)
+    return w_fp8, scale.squeeze(-1)
+
+
+def dequantize_mxfp8(w_fp8, scale, block=32):
+    """Inverse of quantize_mxfp8 -> fp32 tensor of w_fp8's shape."""
+    shape = w_fp8.shape
+    blocks = w_fp8.to(torch.float32).reshape(*shape[:-1], shape[-1] // block, block)
+    return (blocks * scale.to(torch.float32).unsqueeze(-1)).reshape(shape)
+
+
+def _fp4_encode(x):
+    levels = FP4_LEVELS.to(x.device)
+    bounds = (levels[1:] + levels[:-1]) / 2
+    mag_idx = torch.bucketize(x.abs(), bounds).to(torch.uint8)
+    sign_bit = (x < 0).to(torch.uint8)
+    return (sign_bit << 3) | mag_idx
+
+
+def _fp4_decode(code):
+    levels = FP4_LEVELS.to(code.device)
+    mag = levels[(code & 0x7).long()]
+    sign = 1.0 - 2.0 * ((code >> 3) & 0x1).to(torch.float32)
+    return sign * mag
+
+
+def quantize_mxfp4(w, block=32):
+    """MXFP4 quantization along the last dim, packed two values per uint8."""
+    shape = w.shape
+    blocks = w.reshape(*shape[:-1], shape[-1] // block, block)
+    scale = _ue8m0_scale(blocks.abs().amax(dim=-1, keepdim=True), FP4_MAX)
+    codes = _fp4_encode((blocks / scale.to(torch.float32)).reshape(shape))
+    lo, hi = codes[..., 0::2], codes[..., 1::2]
+    packed = (hi << 4) | lo
+    return packed, scale.squeeze(-1)
+
+
+def dequantize_mxfp4(packed, scale, block=32):
+    """Inverse of quantize_mxfp4 -> fp32 tensor with last dim K = 2 * packed_K."""
+    lo = packed & 0x0F
+    hi = packed >> 4
+    codes = torch.stack((lo, hi), dim=-1).reshape(*packed.shape[:-1], -1)
+    values = _fp4_decode(codes)
+    shape = values.shape
+    blocks = values.reshape(*shape[:-1], shape[-1] // block, block)
+    return (blocks * scale.to(torch.float32).unsqueeze(-1)).reshape(shape)
